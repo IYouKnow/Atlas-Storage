@@ -1,0 +1,6 @@
+users.json
+config/
+data/
+.env
+atlas-linux
+atlas.exe
