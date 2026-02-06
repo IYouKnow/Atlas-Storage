@@ -1,12 +1,15 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/IYouKnow/atlas-drive/pkg/user"
 	"golang.org/x/net/webdav"
@@ -42,13 +45,22 @@ func (s *Server) Start() error {
 		LockSystem: webdav.NewMemLS(),
 		Logger: func(r *http.Request, err error) {
 			if err != nil {
+				// 1. Log Noise Suppression
+				// Suppress 404 errors for common Windows system files
+				if os.IsNotExist(err) {
+					base := strings.ToLower(filepath.Base(r.URL.Path))
+					switch base {
+					case "desktop.ini", "autorun.inf", "thumbs.db", "folder.jpg":
+						return
+					}
+				}
 				log.Printf("WebDAV Error: %s %s: %v", r.Method, r.URL.Path, err)
 			}
 		},
 	}
 
-	// Chain middlewares: Auth -> MimeFix -> WebDAV
-	handler := s.authMiddleware(s.mimeMiddleware(webdavHandler))
+	// Chain middlewares: Auth -> MimeFix -> Quota -> WebDAV
+	handler := s.authMiddleware(s.mimeMiddleware(s.quotaMiddleware(webdavHandler)))
 
 	s.HTTPServer = &http.Server{
 		Addr:    s.Addr,
@@ -92,30 +104,89 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 func (s *Server) mimeMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Windows WebDAV client often relies on the server providing the correct Content-Type.
-		// We can sniff the extension or content.
-		// For HEAD/GET requests, we should try to hint.
-
-		next.ServeHTTP(w, r)
-
-		// Note: wrapping next.ServeHTTP means headers are already written by the time we return
-		// if usage is standard. So we must set headers BEFORE calling next, or wrap the ResponseWriter.
-		// However, webdav handler might verify existence first.
-
-		// The `golang.org/x/net/webdav` ServeHTTP implementation handles Content-Type for GET requests file serving.
-		// But let's be explicit if we can.
-		// Actually, standard net/http file server does this well. WebDAV might be minimal.
-		// Let's rely on standard behavior first, but if we need to force it:
-
-		// A simple improvement: set MIME based on extension if not set?
-		// But we don't know the file content here easily without interfering.
-
-		// For now, basic WebDAV usually works. The User emphasized "Windows Quirks".
-		// Common fix: ensure registry has mime types on client (not our control),
-		// OR ensure server sends it.
-		// Let's attempt to use mime.TypeByExtension.
 		ext := filepath.Ext(r.URL.Path)
 		if t := mime.TypeByExtension(ext); t != "" {
 			w.Header().Set("Content-Type", t)
 		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// responseBuffer captures the response to allow modification.
+type responseBuffer struct {
+	http.ResponseWriter
+	body *bytes.Buffer
+	code int
+}
+
+func (w *responseBuffer) WriteHeader(code int) {
+	w.code = code
+}
+
+func (w *responseBuffer) Write(b []byte) (int, error) {
+	return w.body.Write(b)
+}
+
+// quotaMiddleware implements RFC 4331 by injecting quota properties into PROPFIND responses.
+func (s *Server) quotaMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 2. Disk Space Reporting
+		// Intercept PROPFIND on the root path
+		if r.Method == "PROPFIND" && r.URL.Path == "/" {
+			rb := &responseBuffer{
+				ResponseWriter: w,
+				body:           new(bytes.Buffer),
+				code:           http.StatusOK, // Default
+			}
+
+			next.ServeHTTP(rb, r)
+
+			// If successful PROPFIND (MultiStatus), inject quota
+			if rb.code == http.StatusMultiStatus {
+				bodyStr := rb.body.String()
+
+				// Ensure we use absolute path for Statfs
+				absPath, _ := filepath.Abs(s.DataDir) // ignoring error, default to s.DataDir if fail
+				if absPath == "" {
+					absPath = s.DataDir
+				}
+
+				// Calculate quota
+				free, used, err := getDiskUsage(absPath)
+				total := free + used
+
+				// Explicit Debug Logs as requested
+				log.Printf("DEBUG QUOTA: Path=%s | Total=%d | Free=%d", absPath, total, free)
+
+				if err == nil {
+					// Inject properties before the first closing </D:prop>
+					// Ensure strict namespacing. We assume the response uses 'D:' prefix for DAV:
+					// If the webdav library changes prefixes, this might need adjustment, but D: is standard for x/net/webdav.
+					quotaProps := fmt.Sprintf("<D:quota-available-bytes>%d</D:quota-available-bytes><D:quota-used-bytes>%d</D:quota-used-bytes>", free, used)
+					if idx := strings.Index(bodyStr, "</D:prop>"); idx != -1 {
+						bodyStr = bodyStr[:idx] + quotaProps + bodyStr[idx:]
+					}
+				}
+
+				// Copy headers from the captured response (WebDAV sets these)
+				// Note: Since we didn't call WriteHeader on w, we can set them now.
+				// However, next.ServeHTTP logic might have tried to set headers on rb.
+				// Since rb embeds http.ResponseWriter, calling rb.Header() calls w.Header().
+				// So headers set by webdav handler are ALREADY in w.
+
+				// We just need to update Content-Length if it changed
+				w.Header().Set("Content-Length", fmt.Sprint(len(bodyStr)))
+				w.WriteHeader(rb.code)
+				w.Write([]byte(bodyStr))
+				return
+			}
+
+			// If not MultiStatus or we shouldn't modify it, just flush buffer
+			w.WriteHeader(rb.code)
+			w.Write(rb.body.Bytes())
+			return
+		}
+
+		next.ServeHTTP(w, r)
 	})
 }
