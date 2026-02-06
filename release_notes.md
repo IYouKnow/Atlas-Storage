@@ -1,18 +1,13 @@
-# Changelog v1.0.0
+# Changelog
 
-This is the initial release of Atlas Storage.
+## v1.0.1
 
-## New Features
-* **Core WebDAV Server:** Implemented standard WebDAV compliant server (compatible with Windows Explorer mounting).
-* **CLI Management:** Added `atlas user` commands (`add`, `ls`, `rm`) to manage access control without editing files manually.
-* **Authentication:** Built-in Basic Auth middleware backed by a persistent `users.json` database.
-* **Configuration:** Added support for Environment Variables (`ATLAS_PORT`, `ATLAS_DATA_DIR`) for 12-factor app compliance.
+### New Features
+* **Storage quota reporting:** Optional `--quota` flag (e.g. `2G`, `512M`) so the WebDAV share reports a fixed capacity to clients. Used space is the size of the data directory; available space is quota minus used. Clients that support RFC 4331 (e.g. macOS Finder) will show the correct size. 
 
-## Infrastructure & Build
-* **Multi-Arch Support:** Cross-compilation enabled for Linux AMD64 (Servers) and ARM64 (Raspberry Pi).
-* **Docker:** Included `Dockerfile` and `docker-compose.yml` for containerized deployment.
-* **CI/CD:** Automated GitHub Actions pipeline for building and publishing releases.
+  *Note: Windows Explorer does not use server-reported quota and will still show the local C: drive size.*
+* **README:** Added project README with features overview, commands, server flags, quick start, and configuration.
 
-## Assets
-* `atlas-linux-amd64`: For standard Linux servers/VPS.
-* `atlas-linux-arm64`: For Raspberry Pi and ARM servers.
+### Changes
+* **Server:** New `QuotaBytes` field and `--quota` CLI/config/env (`ATLAS_QUOTA`) support. When set, PROPFIND responses inject `quota-available-bytes` and `quota-used-bytes` based on the quota and actual dir usage instead of the host filesystem.
+* **Quota middleware:** Uses `getDirUsedBytes()` for quota-based reporting when `QuotaBytes > 0`; otherwise keeps previous filesystem-based disk usage (Linux) or stub (other OS).
