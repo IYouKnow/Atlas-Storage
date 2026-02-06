@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/IYouKnow/atlas-drive/pkg/user"
@@ -20,15 +22,18 @@ type Server struct {
 	Addr       string
 	DataDir    string
 	UserStore  *user.Store
+	QuotaBytes uint64 // If > 0, WebDAV reports this as total quota (used = size of DataDir; available = quota - used).
 	HTTPServer *http.Server
 }
 
-// New creates a new Server instance.
-func New(addr, dataDir string, store *user.Store) *Server {
+// New creates a new Server instance. quotaBytes is the advertised storage quota in bytes;
+// 0 means report the underlying filesystem's free/used space (previous behaviour).
+func New(addr, dataDir string, store *user.Store, quotaBytes uint64) *Server {
 	return &Server{
-		Addr:      addr,
-		DataDir:   dataDir,
-		UserStore: store,
+		Addr:       addr,
+		DataDir:    dataDir,
+		UserStore:  store,
+		QuotaBytes: quotaBytes,
 	}
 }
 
@@ -129,64 +134,118 @@ func (w *responseBuffer) Write(b []byte) (int, error) {
 
 // quotaMiddleware implements RFC 4331 by injecting quota properties into PROPFIND responses.
 func (s *Server) quotaMiddleware(next http.Handler) http.Handler {
+	// Pre-compile regex to find the closing prop tag (handling namespaces like D:prop or d:prop or just prop)
+	// We want to insert BEFORE this tag.
+	// Common patterns: </D:prop>, </d:prop>, </prop>
+	propEndRegex := regexp.MustCompile(`(</[a-zA-Z0-9_:]*prop>)`)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 2. Disk Space Reporting
-		// Intercept PROPFIND on the root path
+		// We only care about PROPFIND on the root.
 		if r.Method == "PROPFIND" && r.URL.Path == "/" {
 			rb := &responseBuffer{
 				ResponseWriter: w,
 				body:           new(bytes.Buffer),
-				code:           http.StatusOK, // Default
+				code:           http.StatusOK, // Default to 200 if not set
 			}
 
+			// Pass the buffer to the real handler
 			next.ServeHTTP(rb, r)
 
-			// If successful PROPFIND (MultiStatus), inject quota
-			if rb.code == http.StatusMultiStatus {
-				bodyStr := rb.body.String()
-
-				// Ensure we use absolute path for Statfs
-				absPath, _ := filepath.Abs(s.DataDir) // ignoring error, default to s.DataDir if fail
-				if absPath == "" {
-					absPath = s.DataDir
-				}
-
-				// Calculate quota
-				free, used, err := getDiskUsage(absPath)
-				total := free + used
-
-				// Explicit Debug Logs as requested
-				log.Printf("DEBUG QUOTA: Path=%s | Total=%d | Free=%d", absPath, total, free)
-
-				if err == nil {
-					// Inject properties before the first closing </D:prop>
-					// Ensure strict namespacing. We assume the response uses 'D:' prefix for DAV:
-					// If the webdav library changes prefixes, this might need adjustment, but D: is standard for x/net/webdav.
-					quotaProps := fmt.Sprintf("<D:quota-available-bytes>%d</D:quota-available-bytes><D:quota-used-bytes>%d</D:quota-used-bytes>", free, used)
-					if idx := strings.Index(bodyStr, "</D:prop>"); idx != -1 {
-						bodyStr = bodyStr[:idx] + quotaProps + bodyStr[idx:]
-					}
-				}
-
-				// Copy headers from the captured response (WebDAV sets these)
-				// Note: Since we didn't call WriteHeader on w, we can set them now.
-				// However, next.ServeHTTP logic might have tried to set headers on rb.
-				// Since rb embeds http.ResponseWriter, calling rb.Header() calls w.Header().
-				// So headers set by webdav handler are ALREADY in w.
-
-				// We just need to update Content-Length if it changed
-				w.Header().Set("Content-Length", fmt.Sprint(len(bodyStr)))
+			// If the operation wasn't successful MultiStatus, just pass it through
+			if rb.code != http.StatusMultiStatus {
 				w.WriteHeader(rb.code)
-				w.Write([]byte(bodyStr))
+				w.Write(rb.body.Bytes())
 				return
 			}
 
-			// If not MultiStatus or we shouldn't modify it, just flush buffer
+			// It is MultiStatus. Let's process the XML.
+			bodyBytes := rb.body.Bytes()
+			bodyStr := string(bodyBytes)
+
+			// Determine which namespace prefix is used for quota properties.
+			// Usually "D" or "d". The standard lib uses "D".
+			// We can try to infer or just default to "D".
+			// Let's use "D" but ensure xmlns:D="DAV:" is present.
+			// Actually, we are injecting inside < prop > ... < /prop >
+			// The surrounding tags define the namespace context.
+			// To be safe, we will use <D:quota-...> and trust that <D:multistatus xmlns:D="DAV:"> is at the top.
+			// Most clients (including Windows) are fine if we use the same prefix as the root element.
+
+			// Calculate disk usage: either quota-based (share size) or filesystem-based
+			var free, used uint64
+			var err error
+			if s.QuotaBytes > 0 {
+				used, err = getDirUsedBytes(s.DataDir)
+				if err == nil {
+					if used > s.QuotaBytes {
+						used = s.QuotaBytes
+					}
+					if s.QuotaBytes >= used {
+						free = s.QuotaBytes - used
+					}
+				}
+			} else {
+				absPath, _ := filepath.Abs(s.DataDir)
+				if absPath == "" {
+					absPath = s.DataDir
+				}
+				free, used, err = getDiskUsage(absPath)
+			}
+
+			if err == nil {
+				// Detect usage of namespace prefix for DAV: directly from the XML
+				// Standard lib usually uses "D" or "d".
+				prefix := "D"
+				nsRegex := regexp.MustCompile(`xmlns:([a-zA-Z0-9_]+)="DAV:"`)
+				if match := nsRegex.FindStringSubmatch(bodyStr); len(match) > 1 {
+					prefix = match[1]
+				}
+
+				// Construct insertion string using the MATCHED prefix
+				quotaXML := fmt.Sprintf(
+					"<%s:quota-available-bytes>%d</%s:quota-available-bytes><%s:quota-used-bytes>%d</%s:quota-used-bytes>",
+					prefix, free, prefix, prefix, used, prefix,
+				)
+
+				// Find insertion point: the first closing </...prop> tag.
+				loc := propEndRegex.FindStringIndex(bodyStr)
+				if loc != nil {
+					// Insert before the tag
+					start := loc[0]
+					newBody := bodyStr[:start] + quotaXML + bodyStr[start:]
+					bodyBytes = []byte(newBody)
+				}
+			} else {
+				log.Printf("WebDAV Warning: failed to get disk usage: %v", err)
+			}
+
+			// Write the modified response
+			// IMPORTANT: Update Content-Length to match new size
+			w.Header().Set("Content-Length", strconv.Itoa(len(bodyBytes)))
+			// Ensure Content-Type is set (webdav lib usually sets it, but good to ensure)
+			if w.Header().Get("Content-Type") == "" {
+				w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			}
+
+			// We do NOT need to set "DAV" or "Allow" headers manually because next.ServeHTTP (the library)
+			// ALREADY set them on the underlying ResponseWriter (w) before writing to rb,
+			// OR it set them on rb (headers map is shared if rb.ResponseWriter is w).
+			// responseBuffer embeds http.ResponseWriter, so rb.Header() IS w.Header().
+			// So headers are fine.
+
 			w.WriteHeader(rb.code)
-			w.Write(rb.body.Bytes())
+			w.Write(bodyBytes)
 			return
 		}
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
